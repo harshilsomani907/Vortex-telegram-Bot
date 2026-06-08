@@ -27,6 +27,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # Text message sent immediately when a user writes anything
 WELCOME_TEXT = "Welcome! Thanks for messaging Vortex 🔥"
 
+# Error message returned when all models fail
+ERROR_HIGH_DEMAND = "Vortex AI is currently experiencing high demand. Please try sending your message again in a few moments."
+
 # AI system prompt — controls the bot's personality
 SYSTEM_PROMPT = (
     "You are Vortex, a smart, friendly, and helpful Telegram bot assistant. "
@@ -71,8 +74,8 @@ def ask_gemini(user_message: str = None, voice_data: bytes = None, mime_type: st
     if not parts:
         return "I received an empty message."
 
-    # List of models to try (prioritizing 3.5-flash, with 2.5-flash fallback if quota is exceeded)
-    models = ["gemini-3.5-flash", "gemini-2.5-flash"]
+    # List of models to try (prioritizing 3.5-flash, with fallbacks if quota is exceeded or unavailable)
+    models = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
     last_error = "Unknown error"
     
     for model in models:
@@ -94,44 +97,42 @@ def ask_gemini(user_message: str = None, voice_data: bytes = None, mime_type: st
             
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
         
-        # Retry up to 2 times with backoff only on transient 503 errors
-        retries = 2
-        backoff = 1.0
-        
-        for attempt in range(retries):
-            try:
-                resp = requests.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                    timeout=30,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                elif resp.status_code == 429:
-                    # Quota exhausted — skip immediately to next model, no point retrying
-                    last_error = f"{model} quota exhausted (429)"
-                    logger.warning(f"{model} quota exhausted (429). Skipping to next model...")
-                    break
-                elif resp.status_code == 503:
-                    # Transient overload — worth retrying after a short wait
-                    last_error = f"{model} overloaded (503)"
-                    logger.warning(f"{model} overloaded (503) on attempt {attempt+1}. Retrying in {backoff}s...")
-                    time.sleep(backoff)
-                    backoff *= 2.0
+        try:
+            resp = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts_data = candidates[0].get("content", {}).get("parts", [])
+                    if parts_data and "text" in parts_data[0]:
+                        return parts_data[0]["text"].strip()
+                    else:
+                        finish_reason = candidates[0].get("finishReason")
+                        last_error = f"{model} response did not contain text (reason: {finish_reason})"
+                        logger.warning(f"{model} response did not contain text (reason: {finish_reason}). Response: {data}")
                 else:
-                    last_error = f"Gemini API returned status {resp.status_code}: {resp.text}"
-                    logger.warning(f"{model} failed with status {resp.status_code}. Skipping...")
-                    break
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(f"{model} exception on attempt {attempt+1}: {e}. Retrying in {backoff}s...")
-                time.sleep(backoff)
-                backoff *= 2.0
+                    last_error = f"{model} returned no candidates"
+                    logger.warning(f"{model} returned no candidates. Response: {data}")
+            elif resp.status_code == 429:
+                last_error = f"{model} quota exhausted (429)"
+                logger.warning(f"{model} quota exhausted (429). Trying next model...")
+            elif resp.status_code == 503:
+                last_error = f"{model} overloaded (503)"
+                logger.warning(f"{model} overloaded (503). Trying next model...")
+            else:
+                last_error = f"Gemini API returned status {resp.status_code}: {resp.text}"
+                logger.warning(f"{model} failed with status {resp.status_code}. Trying next model...")
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"{model} exception: {e}. Trying next model...")
                 
     logger.error(f"All Gemini models failed. Last error: {last_error}")
-    return "Vortex AI is currently experiencing high demand. Please try sending your message again in a few moments."
+    return ERROR_HIGH_DEMAND
 
 
 # ── Audio conversion helpers ──────────────────────────────────────────────────
@@ -171,34 +172,43 @@ def convert_to_mp3(audio_bytes: bytes) -> bytes:
 
 
 def text_to_ogg(text: str) -> str:
-    """Convert text to a proper OGG Opus voice file using ffmpeg and return the path."""
-    tts = gTTS(text=text, lang="en", slow=False)
-    
-    mp3_tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-    mp3_tmp.close()
-    tts.save(mp3_tmp.name)
-    
+    """Convert text to a proper OGG Opus voice file using ffmpeg and return the path, or None on failure."""
+    try:
+        tts = gTTS(text=text, lang="en", slow=False)
+        
+        mp3_tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        mp3_tmp_path = mp3_tmp.name
+        mp3_tmp.close()
+        tts.save(mp3_tmp_path)
+    except Exception as tts_err:
+        logger.error(f"gTTS generation or save failed: {tts_err}")
+        return None
+        
     ogg_tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+    ogg_tmp_path = ogg_tmp.name
     ogg_tmp.close()
     
     try:
         cmd = [
             "ffmpeg",
             "-y",
-            "-i", mp3_tmp.name,
+            "-i", mp3_tmp_path,
             "-c:a", "libopus",
-            ogg_tmp.name
+            ogg_tmp_path
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        return ogg_tmp.name
+        # Successfully transcoded to Ogg Opus, so we can clean up the temporary mp3 file
+        if os.path.exists(mp3_tmp_path):
+            os.unlink(mp3_tmp_path)
+        return ogg_tmp_path
     except Exception as e:
-        logger.error(f"ffmpeg conversion error: {e}. Falling back to raw gTTS output.")
-        if os.path.exists(ogg_tmp.name):
-            os.unlink(ogg_tmp.name)
-        return mp3_tmp.name
-    finally:
-        if os.path.exists(mp3_tmp.name):
-            os.unlink(mp3_tmp.name)
+        logger.error(f"ffmpeg conversion error: {e}. Falling back to raw gTTS output (MP3).")
+        if os.path.exists(ogg_tmp_path):
+            try:
+                os.unlink(ogg_tmp_path)
+            except Exception:
+                pass
+        return mp3_tmp_path
 
 
 # ── Telegram handlers ──────────────────────────────────────────────────────────
@@ -336,6 +346,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # ── Step 4: Send Gemini's reply as text ───────────────────────────────────
         await update.message.reply_text(f"🤖 {gemini_reply}")
 
+        # If we returned the high-demand fallback error message, do not attempt to generate voice reply
+        if gemini_reply == ERROR_HIGH_DEMAND:
+            return
+
         # ── Step 5: Convert to voice and send ─────────────────────────────────────
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, action="record_voice"
@@ -344,17 +358,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ogg_path = None
         try:
             ogg_path = text_to_ogg(gemini_reply)
-            with open(ogg_path, "rb") as voice_file:
-                await update.message.reply_voice(
-                    voice=voice_file,
-                    caption="🔊 Vortex voice reply",
-                )
+            if ogg_path and os.path.exists(ogg_path):
+                with open(ogg_path, "rb") as voice_file:
+                    await update.message.reply_voice(
+                        voice=voice_file,
+                        caption="🔊 Vortex voice reply",
+                    )
+            else:
+                logger.warning("Could not generate valid audio file for voice reply.")
         except Exception as e:
             logger.error(f"Voice send error: {e}")
-            await update.message.reply_text("⚠️ Couldn't send voice message right now.")
         finally:
             if ogg_path and os.path.exists(ogg_path):
-                os.unlink(ogg_path)
+                try:
+                    os.unlink(ogg_path)
+                except Exception as unlink_err:
+                    logger.warning(f"Failed to delete temp file {ogg_path}: {unlink_err}")
 
     except Exception as general_err:
         logger.error(f"General message handling error: {general_err}", exc_info=True)
