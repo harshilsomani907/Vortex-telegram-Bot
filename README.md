@@ -48,7 +48,9 @@ Run the bot:
 ```bash
 python bot.py
 ```
+## link of bot - 
 
+https://t.me/Vortex_786_Bot
 ## Deployment
 
 The bot is deployed on Railway using environment variables for secure credential management.
