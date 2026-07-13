@@ -1,330 +1,193 @@
+import base64
 import logging
 import os
-import time
-import tempfile
-import requests
 import subprocess
+import tempfile
+
+import requests
 from dotenv import load_dotenv
 from gtts import gTTS
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# Load environment variables from .env file
 load_dotenv()
 
-# ─────────────────────────────────────────────
-#  CONFIGURATION  — environment variables loaded from .env
-# ─────────────────────────────────────────────
-BOT_TOKEN      = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Text message sent immediately when a user writes anything
-WELCOME_TEXT = "Welcome! Thanks for messaging Vortex 🔥"
-
-# Error message returned when all models fail
 ERROR_HIGH_DEMAND = "Vortex AI is currently experiencing high demand. Please try sending your message again in a few moments."
+MAX_FILE_SIZE = 20 * 1024 * 1024  # Telegram's own limit
 
-# AI system prompt — controls the bot's personality
 SYSTEM_PROMPT = (
     "You are Vortex, a smart, friendly, and helpful Telegram bot assistant. "
-    "Provide crisp, highly accurate, and directly meaningful answers addressing the user's query in full. "
-    "Keep your response clear, structured, and engaging, ensuring all aspects of the user's question or requirements are completely fulfilled. "
-    "Avoid unnecessary fluff, remain professional yet warm, and never mention that you are an AI or made by Google."
+    "Always answer briefly and to the point — a few short sentences at most, no long explanations "
+    "unless the user explicitly asks for more detail. Avoid unnecessary fluff, remain professional yet "
+    "warm, and never mention that you are an AI or made by Google."
 )
-# ─────────────────────────────────────────────
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
+GEMINI_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# ── Gemini API helper ──────────────────────────────────────────────────────────
+# ── Gemini ───────────────────────────────────────────────────────────────
 
 def ask_gemini(user_message: str = None, voice_data: bytes = None, mime_type: str = None) -> str:
-    """Send a message/audio to Gemini and return the text reply, with robust retries and fallbacks."""
-    headers = {
-        "Content-Type": "application/json",
-    }
-    
+    """Send text and/or audio to Gemini, trying each model until one works."""
     parts = []
     if voice_data and mime_type:
-        import base64
-        encoded_data = base64.b64encode(voice_data).decode("utf-8")
-        clean_mime_type = mime_type.split(";")[0].strip()
-        parts.append({
-            "inlineData": {
-                "mimeType": clean_mime_type,
-                "data": encoded_data
-            }
-        })
-    
+        parts.append({"inlineData": {
+            "mimeType": mime_type.split(";")[0].strip(),
+            "data": base64.b64encode(voice_data).decode("utf-8"),
+        }})
     if user_message:
         parts.append({"text": user_message})
     elif voice_data:
         parts.append({"text": "Please listen to the voice message and respond to it."})
-        
+
     if not parts:
         return "I received an empty message."
 
-    # List of models to try (prioritizing 3.5-flash, with fallbacks if quota is exceeded or unavailable)
-    models = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
-    last_error = "Unknown error"
-    
-    for model in models:
+    last_error = "unknown error"
+    for model in GEMINI_MODELS:
         payload = {
-            "systemInstruction": {
-                "parts": [{"text": SYSTEM_PROMPT}]
-            },
+            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
             "contents": [{"parts": parts}],
-            "generationConfig": {
-                "maxOutputTokens": 8000
-            }
+            "generationConfig": {"maxOutputTokens": 8000},
         }
-        
-        # Add thinkingConfig only for the 3.5-flash model
         if model == "gemini-3.5-flash":
-            payload["generationConfig"]["thinkingConfig"] = {
-                "thinkingLevel": "MINIMAL"
-            }
-            
+            payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "MINIMAL"}
+
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-        
         try:
-            resp = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts_data = candidates[0].get("content", {}).get("parts", [])
-                    if parts_data and "text" in parts_data[0]:
-                        return parts_data[0]["text"].strip()
-                    else:
-                        finish_reason = candidates[0].get("finishReason")
-                        last_error = f"{model} response did not contain text (reason: {finish_reason})"
-                        logger.warning(f"{model} response did not contain text (reason: {finish_reason}). Response: {data}")
-                else:
-                    last_error = f"{model} returned no candidates"
-                    logger.warning(f"{model} returned no candidates. Response: {data}")
-            elif resp.status_code == 429:
-                last_error = f"{model} quota exhausted (429)"
-                logger.warning(f"{model} quota exhausted (429). Trying next model...")
-            elif resp.status_code == 503:
-                last_error = f"{model} overloaded (503)"
-                logger.warning(f"{model} overloaded (503). Trying next model...")
-            else:
-                last_error = f"Gemini API returned status {resp.status_code}: {resp.text}"
-                logger.warning(f"{model} failed with status {resp.status_code}. Trying next model...")
+            resp = requests.post(url, json=payload, timeout=30)
         except Exception as e:
-            last_error = str(e)
-            logger.warning(f"{model} exception: {e}. Trying next model...")
-                
+            last_error = f"{model} exception: {e}"
+            logger.warning(last_error)
+            continue
+
+        if resp.status_code != 200:
+            last_error = f"{model} failed with status {resp.status_code}"
+            logger.warning(last_error)
+            continue
+
+        candidates = resp.json().get("candidates", [])
+        reply_parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+        if reply_parts and "text" in reply_parts[0]:
+            return reply_parts[0]["text"].strip()
+
+        last_error = f"{model} returned no usable text"
+        logger.warning(last_error)
+
     logger.error(f"All Gemini models failed. Last error: {last_error}")
     return ERROR_HIGH_DEMAND
 
 
-# ── Audio conversion helpers ──────────────────────────────────────────────────
+# ── Audio helpers ────────────────────────────────────────────────────────
+
+def _run_ffmpeg(args: list) -> None:
+    subprocess.run(["ffmpeg", "-y", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
 
 def convert_to_mp3(audio_bytes: bytes) -> bytes:
-    """Convert any incoming audio bytes to standard mp3 bytes using ffmpeg."""
-    in_tmp = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
-    in_tmp.write(audio_bytes)
-    in_tmp.close()
-    
-    out_tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-    out_tmp.close()
-    
+    """Normalize any incoming audio to a small mp3 via ffmpeg."""
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as src:
+        src.write(audio_bytes)
+    out_path = src.name + ".mp3"
     try:
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i", in_tmp.name,
-            "-vn",
-            "-ar", "16000",
-            "-ac", "1",
-            "-b:a", "32k",
-            out_tmp.name
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        with open(out_tmp.name, "rb") as f:
-            converted_bytes = f.read()
-        return converted_bytes
+        _run_ffmpeg(["-i", src.name, "-vn", "-ar", "16000", "-ac", "1", "-b:a", "32k", out_path])
+        with open(out_path, "rb") as f:
+            return f.read()
     except Exception as e:
         logger.error(f"Failed to convert audio to MP3: {e}")
-        return audio_bytes  # Return original if ffmpeg fails
+        return audio_bytes
     finally:
-        if os.path.exists(in_tmp.name):
-            os.unlink(in_tmp.name)
-        if os.path.exists(out_tmp.name):
-            os.unlink(out_tmp.name)
+        for path in (src.name, out_path):
+            if os.path.exists(path):
+                os.unlink(path)
 
 
-def text_to_ogg(text: str) -> str:
-    """Convert text to a proper OGG Opus voice file using ffmpeg and return the path, or None on failure."""
+def text_to_ogg(text: str) -> str | None:
+    """Turn text into a voice note (OGG/Opus). Falls back to MP3 if ffmpeg fails."""
+    mp3_path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
     try:
-        tts = gTTS(text=text, lang="en", slow=False)
-        
-        mp3_tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-        mp3_tmp_path = mp3_tmp.name
-        mp3_tmp.close()
-        tts.save(mp3_tmp_path)
-    except Exception as tts_err:
-        logger.error(f"gTTS generation or save failed: {tts_err}")
-        return None
-        
-    ogg_tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
-    ogg_tmp_path = ogg_tmp.name
-    ogg_tmp.close()
-    
-    try:
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i", mp3_tmp_path,
-            "-c:a", "libopus",
-            ogg_tmp_path
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        # Successfully transcoded to Ogg Opus, so we can clean up the temporary mp3 file
-        if os.path.exists(mp3_tmp_path):
-            os.unlink(mp3_tmp_path)
-        return ogg_tmp_path
+        gTTS(text=text, lang="en", slow=False).save(mp3_path)
     except Exception as e:
-        logger.error(f"ffmpeg conversion error: {e}. Falling back to raw gTTS output (MP3).")
-        if os.path.exists(ogg_tmp_path):
-            try:
-                os.unlink(ogg_tmp_path)
-            except Exception:
-                pass
-        return mp3_tmp_path
+        logger.error(f"gTTS failed: {e}")
+        return None
+
+    ogg_path = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False).name
+    try:
+        _run_ffmpeg(["-i", mp3_path, "-c:a", "libopus", ogg_path])
+        os.unlink(mp3_path)
+        return ogg_path
+    except Exception as e:
+        logger.error(f"ffmpeg conversion error: {e}. Falling back to MP3.")
+        if os.path.exists(ogg_path):
+            os.unlink(ogg_path)
+        return mp3_path
 
 
-# ── Telegram handlers ──────────────────────────────────────────────────────────
+# ── Telegram handlers ────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command."""
     await update.message.reply_text(
         "🚀 *Welcome to Vortex AI* 🔥\n\n"
         "I am your advanced, high-performance virtual assistant powered by state-of-the-art AI. "
         "Here is what I can do for you:\n\n"
-        "🧠 *Smart AI Reply*: Send me a text, voice message, or audio file, and I will generate an intelligent, helpful response.\n"
+        "🧠 *Smart AI Reply*: Send me a text, voice message, or audio file, and I will generate an "
+        "intelligent, helpful response.\n"
         "🎙️ *Voice Response*: I will also deliver my AI response read aloud as a voice note!\n\n"
         "Go ahead—ask me anything, send a voice note, or say hello! 👇",
         parse_mode="Markdown",
     )
 
 
+async def _download_audio(tg_file, fallback_mime: str) -> tuple[bytes, str]:
+    """Download a Telegram file and convert it to mp3, falling back to the raw bytes on failure."""
+    raw = bytes(await (await tg_file.get_file()).download_as_bytearray())
+    try:
+        return convert_to_mp3(raw), "audio/mp3"
+    except Exception as e:
+        logger.warning(f"Audio conversion failed: {e}. Sending raw.")
+        return raw, fallback_mime
+
+
+UNSUPPORTED_MSG = "⚠️ Vortex AI currently only supports text, voice notes, and audio files. Please send your question as text or voice!"
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Full flow:
-      1. Detect if it's text or voice/audio message
-      2. Download voice/audio if present (enforcing size limits and converting formats)
-      3. Ask Gemini for a reply
-      4. Send Gemini's reply as text
-      5. Convert Gemini's reply to voice and send as audio
-    """
+    """Text/voice in → Gemini reply out, as both text and a spoken voice note."""
     if not update.message:
         return
 
-    user = update.effective_user
-    user_name = user.first_name if user else "Unknown User"
-    MAX_FILE_SIZE = 20 * 1024 * 1024  # Telegram Bot API limit is 20MB
+    msg = update.message
+    chat_id = update.effective_chat.id
+    user_name = update.effective_user.first_name if update.effective_user else "Unknown User"
+    voice_data = mime_type = None
+    user_text = msg.text
+
     try:
-        voice_data = None
-        mime_type = None
-        user_text = update.message.text
+        audio_source = msg.voice or msg.audio
+        doc_is_audio = msg.document and (msg.document.mime_type or "").startswith("audio/")
 
-        # Check if voice is present
-        if update.message.voice:
-            if update.message.voice.file_size and update.message.voice.file_size > MAX_FILE_SIZE:
-                await update.message.reply_text("⚠️ This voice message is too large. Please send a shorter voice message (max 20MB).")
-                return
-                
-            logger.info(f"[{user_name}] Sent a voice message")
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-            
-            voice_file = await update.message.voice.get_file()
-            raw_voice_bytes = bytes(await voice_file.download_as_bytearray())
-            
-            try:
-                voice_data = convert_to_mp3(raw_voice_bytes)
-                mime_type = "audio/mp3"
-            except Exception as conv_err:
-                logger.warning(f"Audio conversion failed: {conv_err}. Sending raw.")
-                voice_data = raw_voice_bytes
-                mime_type = update.message.voice.mime_type or "audio/ogg"
-            
-            if update.message.caption:
-                user_text = update.message.caption
-
-        # Check if audio is present
-        elif update.message.audio:
-            if update.message.audio.file_size and update.message.audio.file_size > MAX_FILE_SIZE:
-                await update.message.reply_text("⚠️ This audio file is too large. Please send an audio file smaller than 20MB.")
-                return
-                
-            logger.info(f"[{user_name}] Sent an audio file")
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-            
-            audio_file = await update.message.audio.get_file()
-            raw_audio_bytes = bytes(await audio_file.download_as_bytearray())
-            
-            try:
-                voice_data = convert_to_mp3(raw_audio_bytes)
-                mime_type = "audio/mp3"
-            except Exception as conv_err:
-                logger.warning(f"Audio conversion failed: {conv_err}. Sending raw.")
-                voice_data = raw_audio_bytes
-                mime_type = update.message.audio.mime_type or "audio/mp3"
-            
-            if update.message.caption:
-                user_text = update.message.caption
-
-        # Check if document is present (covers audio sent as document/file)
-        elif update.message.document:
-            doc_mime = update.message.document.mime_type or ""
-            if doc_mime.startswith("audio/"):
-                if update.message.document.file_size and update.message.document.file_size > MAX_FILE_SIZE:
-                    await update.message.reply_text("⚠️ This audio file is too large. Please send a file smaller than 20MB.")
-                    return
-                    
-                logger.info(f"[{user_name}] Sent an audio document: {update.message.document.file_name}")
-                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-                
-                doc_file = await update.message.document.get_file()
-                raw_audio_bytes = bytes(await doc_file.download_as_bytearray())
-                
-                try:
-                    voice_data = convert_to_mp3(raw_audio_bytes)
-                    mime_type = "audio/mp3"
-                except Exception as conv_err:
-                    logger.warning(f"Audio conversion failed: {conv_err}. Sending raw.")
-                    voice_data = raw_audio_bytes
-                    mime_type = doc_mime
-                
-                if update.message.caption:
-                    user_text = update.message.caption
-            else:
-                logger.info(f"[{user_name}] Sent an unsupported document: {update.message.document.file_name}")
-                await update.message.reply_text("⚠️ Vortex AI currently only supports text, voice notes, and audio files. Please send your question as text or voice!")
+        if audio_source or doc_is_audio:
+            source = audio_source or msg.document
+            if source.file_size and source.file_size > MAX_FILE_SIZE:
+                await msg.reply_text("⚠️ That file is too large. Please send something under 20MB.")
                 return
 
-        # Check if unsupported media types are sent
-        elif update.message.photo or update.message.video or update.message.animation or update.message.sticker:
+            logger.info(f"[{user_name}] Sent an audio message")
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+            fallback_mime = source.mime_type or "audio/ogg"
+            voice_data, mime_type = await _download_audio(source, fallback_mime)
+            if msg.caption:
+                user_text = msg.caption
+
+        elif msg.document or msg.photo or msg.video or msg.animation or msg.sticker:
             logger.info(f"[{user_name}] Sent unsupported media")
-            await update.message.reply_text("⚠️ Vortex AI currently only supports text, voice notes, and audio files. Please send your question as text or voice!")
+            await msg.reply_text(UNSUPPORTED_MSG)
             return
 
         elif user_text:
@@ -332,63 +195,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         else:
             logger.info(f"[{user_name}] Sent empty or unsupported message")
-            await update.message.reply_text("⚠️ Vortex AI currently only supports text, voice notes, and audio files. Please send your question as text or voice!")
+            await msg.reply_text(UNSUPPORTED_MSG)
             return
 
-        # ── Step 2: Typing indicator while Gemini thinks ───────────────────────────
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id, action="typing"
-        )
-
-        # ── Step 3: Get Gemini's reply ─────────────────────────────────────────────
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         gemini_reply = ask_gemini(user_message=user_text, voice_data=voice_data, mime_type=mime_type)
+        await msg.reply_text(f"🤖 {gemini_reply}")
 
-        # ── Step 4: Send Gemini's reply as text ───────────────────────────────────
-        await update.message.reply_text(f"🤖 {gemini_reply}")
-
-        # If we returned the high-demand fallback error message, do not attempt to generate voice reply
         if gemini_reply == ERROR_HIGH_DEMAND:
             return
 
-        # ── Step 5: Convert to voice and send ─────────────────────────────────────
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id, action="record_voice"
-        )
-
+        await context.bot.send_chat_action(chat_id=chat_id, action="record_voice")
         ogg_path = None
         try:
             ogg_path = text_to_ogg(gemini_reply)
             if ogg_path and os.path.exists(ogg_path):
                 with open(ogg_path, "rb") as voice_file:
-                    await update.message.reply_voice(
-                        voice=voice_file,
-                        caption="🔊 Vortex voice reply",
-                    )
+                    await msg.reply_voice(voice=voice_file, caption="🔊 Vortex voice reply")
             else:
-                logger.warning("Could not generate valid audio file for voice reply.")
+                logger.warning("Could not generate a voice reply.")
         except Exception as e:
             logger.error(f"Voice send error: {e}")
         finally:
             if ogg_path and os.path.exists(ogg_path):
-                try:
-                    os.unlink(ogg_path)
-                except Exception as unlink_err:
-                    logger.warning(f"Failed to delete temp file {ogg_path}: {unlink_err}")
+                os.unlink(ogg_path)
 
-    except Exception as general_err:
-        logger.error(f"General message handling error: {general_err}", exc_info=True)
-        await update.message.reply_text("⚠️ Sorry, I encountered an error while processing your message.")
+    except Exception as e:
+        logger.error(f"General message handling error: {e}", exc_info=True)
+        await msg.reply_text("⚠️ Sorry, I encountered an error while processing your message.")
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────
 
 def main() -> None:
-    import asyncio
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-
     if not BOT_TOKEN:
         print("[ERROR] Set your BOT_TOKEN in the .env file or environment!")
         return
